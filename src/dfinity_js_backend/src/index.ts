@@ -194,44 +194,49 @@ const leaderboardStorage = StableBTreeMap(7, text, LeaderboardEntry);
 export default Canister({
   // Create a User Profile with validation
   createUserProfile: update(
-    [UserProfilePayload],
-    Result(User, Error),
-    (payload) => {
-      // Validate the payload
-      if (!payload.name || !payload.contact || !payload.role) {
-        return Err({ InvalidPayload: "Missing required fields" });
-      }
-
-      // Validation for unique contact check
-      const users = usersStorage.values();
-      const contactExists = users.some(
-        (user) => user.contact === payload.contact
-      );
-      if (contactExists) {
-        return Err({ InvalidPayload: "Contact already exists" });
-      }
-
-      // Generate unique user ID
-      const userId = uuidv4();
-
-      // Create the user profile object
-      const user = {
-        id: userId,
-        name: payload.name,
-        contact: payload.contact,
-        role: payload.role,
-        created_at: ic.time(),
-        status: { Active: null },
-        points: 0n, // Initialize points
-      };
-
-      // Insert the user into storage
-      usersStorage.insert(userId, user);
-
-      // Return the created user profile using Ok
-      return Ok(user);
+  [UserProfilePayload],
+  Result(User, Error),
+  (payload) => {
+    // Authentication and Authorization: Ensure the caller is authorized to create profiles
+    if (!ic.caller().is_admin) {
+      return Err({ Unauthorized: "User is not authorized to create profiles" });
     }
-  ),
+
+    // Validate payload
+    if (!payload.name || !payload.contact || !payload.role) {
+      return Err({ InvalidPayload: "Missing required fields" });
+    }
+
+    // Check if contact already exists
+    const users = usersStorage.values();
+    const contactExists = users.some((user) => user.contact === payload.contact);
+    if (contactExists) {
+      return Err({ InvalidPayload: "Contact already exists" });
+    }
+
+    // Generate unique user ID and check UUID uniqueness
+    let userId = uuidv4();
+    while (usersStorage.get(userId) !== None) {
+      userId = uuidv4(); // Ensure unique UUID
+    }
+
+    // Create user profile
+    const user = {
+      id: userId,
+      name: payload.name,
+      contact: payload.contact,
+      role: payload.role,
+      created_at: ic.time(),
+      status: { Active: null },
+      points: 0n,
+    };
+
+    // Insert user profile into storage
+    usersStorage.insert(userId, user);
+
+    return Ok(user); // Return created user profile
+  }
+);
 
   // Get User Profile by ID
   getUserProfile: query([text], Result(User, Error), (userId) => {
@@ -291,99 +296,115 @@ export default Canister({
 
   // Create a Song Request with validation
   createSongRequest: update(
-    [SongRequestPayload],
-    Result(SongRequest, Error),
-    (payload) => {
-      // Validate the payload
-      if (!payload.song_name || !payload.user_id) {
-        return Err({ InvalidPayload: "Missing or invalid input fields" });
-      }
-
-      // Validate if the user exists
-      const userOpt = usersStorage.get(payload.user_id);
-      if ("None" in userOpt) {
-        return Err({ NotFound: `User with ID ${payload.user_id} not found` });
-      }
-
-      // Ensure the user is not a DJ
-      const user = userOpt.Some; // Safely unwrap the user
-
-      if ("DJ" in user.role) {
-        return Err({ InvalidPayload: "DJ cannot make song requests" });
-      }
-
-      // Generate a unique ID for the song request using uuidv4
-      const requestId = uuidv4();
-
-      // Create the song request object
-      const songRequest = {
-        id: requestId,
-        user_id: payload.user_id,
-        song_name: payload.song_name,
-        request_status: { Pending: null },
-        created_at: ic.time(), // Record the current time
-      };
-
-      // Insert the song request into storage
-      songRequestsStorage.insert(requestId, songRequest);
-
-      return Ok(songRequest); // Successfully return the created song request
-    }
-  ),
-
-  // Create a Tip with validation
-  createTip: update([TipPayload], Result(Tip, Error), (payload) => {
-    // Validate the payload
-    if (!payload.dj_name || payload.amount <= 0 || !payload.user_id) {
-      return Err({ InvalidPayload: "Missing or invalid input fields" });
+  [SongRequestPayload],
+  Result(SongRequest, Error),
+  (payload) => {
+    // Authentication: Ensure the caller is a regular user
+    if (!ic.caller().is_regular_user) {
+      return Err({ Unauthorized: "Only regular users can request songs" });
     }
 
-    // Validate if the user exists
+    // Validate payload
+    if (!payload.song_name || !payload.user_id) {
+      return Err({ InvalidPayload: "Missing required fields" });
+    }
+
+    // Ensure the user exists and is not a DJ
     const userOpt = usersStorage.get(payload.user_id);
     if ("None" in userOpt) {
       return Err({ NotFound: `User with ID ${payload.user_id} not found` });
     }
-
-    // Ensure the user is not a DJ
-    const user = userOpt.Some; // Safely unwrap the user
+    const user = userOpt.Some;
     if ("DJ" in user.role) {
-      return Err({ InvalidPayload: "DJ cannot make tips" });
+      return Err({ Unauthorized: "DJ cannot make song requests" });
     }
 
-    // Ensure the DJ exists (case-insensitive search)
-    const djOpt = usersStorage
-      .values()
-      .find((dj) => dj.name.toLowerCase() === payload.dj_name.toLowerCase());
-
-    if (!djOpt) {
-      return Err({ NotFound: `DJ with name ${payload.dj_name} not found` });
+    // Basic rate limiting to prevent abuse
+    const requests = songRequestsStorage.values();
+    const recentRequests = requests.filter(
+      (req) => req.user_id === payload.user_id && ic.time() - req.created_at < 600000 // 10-minute window
+    );
+    if (recentRequests.length > 5) {
+      return Err({ RateLimited: "Too many song requests in a short period" });
     }
 
-    // Generate a unique ID for the tip
-    const tipId = uuidv4();
+    // Generate unique song request ID
+    let requestId = uuidv4();
+    while (songRequestsStorage.get(requestId) !== None) {
+      requestId = uuidv4(); // Ensure unique UUID
+    }
 
-    // Create the tip object
-    const tip = {
-      id: tipId,
+    // Create song request
+    const songRequest = {
+      id: requestId,
       user_id: payload.user_id,
-      dj_name: payload.dj_name,
-      amount: payload.amount,
-      tip_status: { Pending: null }, // Correct use of variant
-      created_at: ic.time(), // Record the current time
+      song_name: payload.song_name,
+      request_status: { Pending: null },
+      created_at: ic.time(),
     };
 
-    // Insert the tip into storage
-    tipsStorage.insert(tipId, tip);
+    songRequestsStorage.insert(requestId, songRequest);
 
-    // Update the leaderboard entry for the DJ
+    return Ok(songRequest);
+  }
+    },
+
+  // Create a Tip with validation
+  createTip: update([TipPayload], Result(Tip, Error), (payload) => {
+  // Authentication: Ensure the caller is a regular user
+  if (!ic.caller().is_regular_user) {
+    return Err({ Unauthorized: "Only regular users can make tips" });
+  }
+
+  // Validate payload
+  if (!payload.dj_name || payload.amount <= 0 || !payload.user_id) {
+    return Err({ InvalidPayload: "Missing required fields" });
+  }
+
+  // Validate user existence and ensure they are not a DJ
+  const userOpt = usersStorage.get(payload.user_id);
+  if ("None" in userOpt) {
+    return Err({ NotFound: `User with ID ${payload.user_id} not found` });
+  }
+  const user = userOpt.Some;
+  if ("DJ" in user.role) {
+    return Err({ InvalidPayload: "DJs cannot make tips" });
+  }
+
+  // Validate DJ existence
+  const djOpt = usersStorage
+    .values()
+    .find((dj) => dj.name.toLowerCase() === payload.dj_name.toLowerCase());
+  if (!djOpt) {
+    return Err({ NotFound: `DJ with name ${payload.dj_name} not found` });
+  }
+
+  // Generate unique tip ID
+  let tipId = uuidv4();
+  while (tipsStorage.get(tipId) !== None) {
+    tipId = uuidv4(); // Ensure unique UUID
+  }
+
+  // Create tip object
+  const tip = {
+    id: tipId,
+    user_id: payload.user_id,
+    dj_name: payload.dj_name,
+    amount: payload.amount,
+    tip_status: { Pending: null },
+    created_at: ic.time(),
+  };
+
+  tipsStorage.insert(tipId, tip);
+
+  // Atomic leaderboard update
+  ic.atomic(() => {
     const leaderboardEntryOpt = leaderboardStorage.get(payload.dj_name);
     if ("Some" in leaderboardEntryOpt) {
-      // Update existing leaderboard entry
       const leaderboardEntry = leaderboardEntryOpt.Some;
       leaderboardEntry.total_tips += payload.amount;
       leaderboardStorage.insert(payload.dj_name, leaderboardEntry);
     } else {
-      // Create new leaderboard entry for the DJ
       const newLeaderboardEntry = {
         dj_name: payload.dj_name,
         total_tips: payload.amount,
@@ -392,42 +413,52 @@ export default Canister({
       };
       leaderboardStorage.insert(payload.dj_name, newLeaderboardEntry);
     }
+  });
 
-    return Ok(tip); // Successfully return the created tip
-  }),
+  return Ok(tip);
+});
+
 
   // Create an Event with validation
   createEvent: update([EventPayload], Result(Event, Error), (payload) => {
-    // Validate the payload
-    if (
-      !payload.event_name ||
-      !payload.dj_name ||
-      !payload.venue ||
-      payload.capacity <= 0 ||
-      !payload.scheduled_at
-    ) {
-      return Err({ InvalidPayload: "Missing or invalid input fields" });
-    }
+  // Authorization: Ensure only DJs can create events
+  if (!ic.caller().is_dj) {
+    return Err({ Unauthorized: "Only DJs can create events" });
+  }
 
-    // Generate a unique ID for the event
-    const eventId = uuidv4();
+  // Validate payload
+  if (
+    !payload.event_name ||
+    !payload.dj_name ||
+    !payload.venue ||
+    payload.capacity <= 0 ||
+    payload.scheduled_at <= ic.time()
+  ) {
+    return Err({ InvalidPayload: "Invalid or missing fields" });
+  }
 
-    // Create the event object
-    const event = {
-      id: eventId,
-      event_name: payload.event_name,
-      dj_name: payload.dj_name,
-      venue: payload.venue,
-      capacity: payload.capacity,
-      scheduled_at: payload.scheduled_at,
-      created_at: ic.time(), // Record the current time
-    };
+  // Generate unique event ID
+  let eventId = uuidv4();
+  while (eventsStorage.get(eventId) !== None) {
+    eventId = uuidv4(); // Ensure unique UUID
+  }
 
-    // Insert the event into storage
-    eventsStorage.insert(eventId, event);
+  // Create event object
+  const event = {
+    id: eventId,
+    event_name: payload.event_name,
+    dj_name: payload.dj_name,
+    venue: payload.venue,
+    capacity: payload.capacity,
+    scheduled_at: payload.scheduled_at,
+    created_at: ic.time(),
+  };
 
-    return Ok(event); // Successfully return the created event
-  }),
+  eventsStorage.insert(eventId, event);
+
+  return Ok(event);
+});
+
 
   // Get All Events
   getAllEvents: query([], Result(Vec(Event), text), () => {
@@ -599,10 +630,17 @@ export default Canister({
 
   // Get all Leaderboard Entries
   getLeaderboard: query([], Result(Vec(LeaderboardEntry), Error), () => {
-    const entries = leaderboardStorage.values();
-    if (entries.length === 0) {
-      return Err({ NotFound: "No leaderboard entries found" });
-    }
-    return Ok(entries); // Return all leaderboard entries
-  }),
+  // Authorization: Only Admins or DJs can view the leaderboard
+  if (!ic.caller().is_admin && !ic.caller().is_dj) {
+    return Err({ Unauthorized: "You are not authorized to view the leaderboard" });
+  }
+
+  const entries = leaderboardStorage.values();
+  if (entries.length === 0) {
+    return Err({ NotFound: "No leaderboard entries found" });
+  }
+
+  return Ok(entries);
+});
+
 });
