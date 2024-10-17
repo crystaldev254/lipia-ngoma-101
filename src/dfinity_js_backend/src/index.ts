@@ -1,5 +1,3 @@
-import { verify } from "@dfinity/agent";
-import { auto } from "@popperjs/core";
 import {
   query,
   update,
@@ -14,23 +12,10 @@ import {
   Ok,
   Err,
   ic,
-  Principal,
-  Opt,
   nat64,
-  Duration,
   Result,
-  bool,
   Canister,
 } from "azle";
-import {
-  Address,
-  Ledger,
-  binaryAddressFromAddress,
-  binaryAddressFromPrincipal,
-  hexAddressFromPrincipal,
-} from "azle/canisters/ledger";
-//@ts-ignore
-import { hashCode } from "hashcode";
 import { v4 as uuidv4 } from "uuid";
 
 // Enums for different features
@@ -123,33 +108,15 @@ const Error = Variant({
   Error: text,
   NotFound: text,
   InvalidPayload: text,
-  PaymentFailed: text,
-  PaymentCompleted: text,
 });
 
-// Payloads
-
-// User Profile Payload
+// Payloads for input validation
 const UserProfilePayload = Record({
   name: text,
   contact: text,
   role: UserRole,
 });
 
-// Song Request Payload
-const SongRequestPayload = Record({
-  song_name: text,
-  user_id: text,
-});
-
-// Tip Payload
-const TipPayload = Record({
-  dj_name: text,
-  amount: nat64,
-  user_id: text,
-});
-
-// Event Payload
 const EventPayload = Record({
   event_name: text,
   dj_name: text,
@@ -158,22 +125,6 @@ const EventPayload = Record({
   scheduled_at: nat64,
 });
 
-// Rating Payload
-const RatingPayload = Record({
-  dj_name: text,
-  rating: nat64,
-  review: text,
-  user_id: text,
-});
-
-// Playlist Payload
-const PlaylistPayload = Record({
-  dj_name: text,
-  event_id: text,
-  song_list: Vec(text),
-});
-
-// Leaderboard Entry Payload
 const LeaderboardEntryPayload = Record({
   dj_name: text,
   total_tips: nat64,
@@ -183,12 +134,8 @@ const LeaderboardEntryPayload = Record({
 
 // Storage initialization
 const usersStorage = StableBTreeMap(0, text, User);
-const songRequestsStorage = StableBTreeMap(2, text, SongRequest);
-const tipsStorage = StableBTreeMap(3, text, Tip);
-const eventsStorage = StableBTreeMap(4, text, Event);
-const playlistsStorage = StableBTreeMap(5, text, Playlist);
-const ratingsStorage = StableBTreeMap(6, text, Rating);
-const leaderboardStorage = StableBTreeMap(7, text, LeaderboardEntry);
+const eventsStorage = StableBTreeMap(1, text, Event);
+const leaderboardStorage = StableBTreeMap(2, text, LeaderboardEntry);
 
 // CRUD Operations
 export default Canister({
@@ -204,17 +151,13 @@ export default Canister({
 
       // Validation for unique contact check
       const users = usersStorage.values();
-      const contactExists = users.some(
-        (user) => user.contact === payload.contact
-      );
+      const contactExists = users.some((user) => user.contact === payload.contact);
       if (contactExists) {
         return Err({ InvalidPayload: "Contact already exists" });
       }
 
-      // Generate unique user ID
+      // Generate unique user ID and create profile
       const userId = uuidv4();
-
-      // Create the user profile object
       const user = {
         id: userId,
         name: payload.name,
@@ -222,13 +165,10 @@ export default Canister({
         role: payload.role,
         created_at: ic.time(),
         status: { Active: null },
-        points: 0n, // Initialize points
+        points: 0n,
       };
 
-      // Insert the user into storage
       usersStorage.insert(userId, user);
-
-      // Return the created user profile using Ok
       return Ok(user);
     }
   ),
@@ -239,46 +179,116 @@ export default Canister({
     if ("None" in userOpt) {
       return Err({ NotFound: `User with ID ${userId} not found` });
     }
-    return Ok(userOpt.Some); // Return the user profile
+    return Ok(userOpt.Some);
   }),
 
-  // Update User Profile by ID with validation
+  // Update User Profile by ID
   updateUserProfile: update(
     [text, UserProfilePayload],
     Result(User, Error),
     (userId, payload) => {
-      // Validate the payload
       if (!payload.name || !payload.contact || !payload.role) {
         return Err({ InvalidPayload: "Missing required fields" });
       }
 
-      // Check if the user exists
       const userOpt = usersStorage.get(userId);
       if ("None" in userOpt) {
         return Err({ NotFound: `User with ID ${userId} not found` });
       }
 
-      // Validation for unique contact check
-      const users = usersStorage.values();
-      const contactExists = users.some(
-        (user) => user.contact === payload.contact && user.id !== userId
-      );
-      if (contactExists) {
-        return Err({ InvalidPayload: "Contact already exists" });
-      }
+      const updatedUser = { ...userOpt.Some, ...payload };
+      usersStorage.insert(userId, updatedUser);
 
-      // Proceed to update the user profile
-      const user = userOpt.Some;
-      const updatedUser = {
-        ...user,
-        ...payload,
-      };
-
-      usersStorage.insert(userId, updatedUser); // Update the user profile
-
-      return Ok(updatedUser); // Successfully return the updated user profile
+      return Ok(updatedUser);
     }
   ),
+
+  // **New Route**: Delete User Profile by ID
+  deleteUserProfile: update([text], Result(bool, Error), (userId) => {
+    const userOpt = usersStorage.get(userId);
+    if ("None" in userOpt) {
+      return Err({ NotFound: `User with ID ${userId} not found` });
+    }
+    usersStorage.remove(userId);
+    return Ok(true); // Return success
+  }),
+
+  // Create an Event with validation
+  createEvent: update([EventPayload], Result(Event, Error), (payload) => {
+    if (!payload.event_name || !payload.dj_name || !payload.venue || payload.capacity <= 0) {
+      return Err({ InvalidPayload: "Missing or invalid input fields" });
+    }
+
+    const eventId = uuidv4();
+    const event = {
+      id: eventId,
+      event_name: payload.event_name,
+      dj_name: payload.dj_name,
+      venue: payload.venue,
+      capacity: payload.capacity,
+      scheduled_at: payload.scheduled_at,
+      created_at: ic.time(),
+    };
+
+    eventsStorage.insert(eventId, event);
+    return Ok(event);
+  }),
+
+  // **New Route**: Update Event by ID
+  updateEvent: update([text, EventPayload], Result(Event, Error), (eventId, payload) => {
+    if (!payload.event_name || !payload.dj_name || !payload.venue || payload.capacity <= 0) {
+      return Err({ InvalidPayload: "Invalid input" });
+    }
+
+    const eventOpt = eventsStorage.get(eventId);
+    if ("None" in eventOpt) {
+      return Err({ NotFound: `Event with ID ${eventId} not found` });
+    }
+
+    const updatedEvent = { ...eventOpt.Some, ...payload };
+    eventsStorage.insert(eventId, updatedEvent);
+    return Ok(updatedEvent);
+  }),
+
+  // **New Route**: Delete Event by ID
+  deleteEvent: update([text], Result(bool, Error), (eventId) => {
+    const eventOpt = eventsStorage.get(eventId);
+    if ("None" in eventOpt) {
+      return Err({ NotFound: `Event with ID ${eventId} not found` });
+    }
+    eventsStorage.remove(eventId);
+    return Ok(true); // Successfully deleted
+  }),
+
+  // Get All Events
+  getAllEvents: query([], Result(Vec(Event), text), () => {
+    const events = eventsStorage.values();
+    if (events.length === 0) {
+      return Err("No events found");
+    }
+    return Ok(events);
+  }),
+
+  // **New Route**: Get Top DJs by Tips and Ratings
+  getLeaderboardForTopDJs: query([], Result(Vec(LeaderboardEntry), Error), () => {
+    const leaderboard = leaderboardStorage.values();
+    const topDJs = leaderboard.sort((a, b) => {
+      if (b.total_tips === a.total_tips) {
+        return Number(b.avg_rating - a.avg_rating); // Sort by avg rating if tips are equal
+      }
+      return Number(b.total_tips - a.total_tips);
+    });
+    return Ok(topDJs.slice(0, 5)); // Return top 5 DJs
+  }),
+
+  // Get all Leaderboard Entries
+  getLeaderboard: query([], Result(Vec(LeaderboardEntry), Error), () => {
+    const entries = leaderboardStorage.values();
+    if (entries.length === 0) {
+      return Err({ NotFound: "No leaderboard entries found" });
+    }
+    return Ok(entries);
+  }),
 
   // Get User Profiles
   getUserProfiles: query([], Result(Vec(User), Error), () => {
